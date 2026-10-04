@@ -80,6 +80,15 @@ class DeliverySubmit(BaseModel):
     address: str
 
 
+class BreakerSettingUpdate(BaseModel):
+    """灰度熔断设置：针对当前策略修订号配置候选侧失败率阈值与观察窗口。"""
+
+    revision: int = Field(ge=1, description="设置所针对（须为当前）的策略修订号")
+    failure_threshold: int = Field(ge=1, le=100, description="候选侧失败率阈值（整数百分比 1–100）")
+    min_samples: int = Field(ge=1, description="最少候选判定数（正整数）")
+    window_minutes: int = Field(ge=1, description="观察窗口（分钟，正整数）")
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定、历史判定核对报表。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、灰度自动熔断、幂等投递判定、历史判定核对报表。"""
 from __future__ import annotations
 
 import sqlite3
@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 
-from . import db, preview, reporting, store
+from . import circuit, db, preview, reporting, store
 from .models import (
+    BreakerSettingUpdate,
     DeliverRequest,
     DeliverySubmit,
     DraftChangesRequest,
@@ -297,6 +298,98 @@ def put_policy(body: PolicyUpdate) -> dict:
     return _policy_doc(policy)
 
 
+# ---------- 灰度熔断（按策略修订号设置候选侧失败率阈值，达标自动熔断） ----------
+
+def _breaker_doc(setting: dict) -> dict:
+    return {
+        "policy_revision": setting["policy_revision"],
+        "failure_threshold": setting["failure_threshold"],
+        "min_samples": setting["min_samples"],
+        "window_minutes": setting["window_minutes"],
+        "created_at": setting["created_at"],
+        "updated_at": setting["updated_at"],
+    }
+
+
+@app.put("/policy/circuit-breaker")
+def put_breaker(body: BreakerSettingUpdate) -> dict:
+    """针对**当前策略修订号**设置灰度熔断参数：失败率阈值（1–100%）、最少候选判定数、
+    观察窗口（分钟，正整数）。
+
+    - 未配置策略 → 409 `policy_not_configured`，不产生任何熔断设置。
+    - 请求修订号不是当前策略修订号（熔断或人工更新已推进修订号）→
+      409 `breaker_revision_conflict`（附当前修订号），旧设置已失效，须针对新修订重新设置。
+    - 非法参数（阈值越界、非正整数等）由请求模型在 422 拒绝，不写库、不产生熔断。
+    - 同修订号重复设置为幂等更新；核对与写入在单个 BEGIN IMMEDIATE 事务内原子完成，
+      与并发投递触发的熔断、人工策略更新串行化，互不覆盖。
+    """
+    try:
+        with db.transaction() as conn:
+            setting = store.put_breaker_setting(
+                conn,
+                expected_revision=body.revision,
+                failure_threshold=body.failure_threshold,
+                min_samples=body.min_samples,
+                window_minutes=body.window_minutes,
+            )
+    except store.PolicyNotConfigured:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "policy_not_configured",
+                    "message": "no delivery policy configured; set a policy before configuring the circuit breaker"},
+        )
+    except store.BreakerRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "breaker_revision_conflict", "revision": exc.revision,
+                    "current_revision": exc.current,
+                    "message": f"circuit-breaker settings must target the current policy revision {exc.current}; "
+                               f"revision {exc.revision} settings are stale, reconfigure for the new revision"},
+        )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return _breaker_doc(setting)
+
+
+@app.get("/policy/circuit-breaker")
+def get_breaker(policy_revision: int | None = Query(default=None, ge=1)) -> dict:
+    """查询熔断设置。缺省 `policy_revision` 时返回当前策略修订号上的设置。
+
+    - 未配置策略 → 409 `policy_not_configured`。
+    - 该修订号（默认当前修订号）未设置熔断（熔断 / 人工更新后旧设置已失效）→
+      404 `breaker_not_configured`（附所查修订号与当前修订号）。
+    """
+    with db.read_transaction() as conn:
+        policy = store.get_policy(conn)
+        if policy is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "policy_not_configured",
+                        "message": "no delivery policy configured"},
+            )
+        revision = policy_revision if policy_revision is not None else policy["revision"]
+        setting = store.get_breaker_setting(conn, revision)
+    if setting is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "breaker_not_configured", "policy_revision": revision,
+                    "current_revision": policy["revision"],
+                    "message": f"no circuit-breaker settings for policy revision {revision}"},
+        )
+    return _breaker_doc(setting)
+
+
+@app.get("/policy/circuit-breaker/trips")
+def list_breaker_trips(policy_revision: int | None = Query(default=None, ge=1)) -> dict:
+    """查询熔断记录（旧修订号、新修订号、样本数、失败数、阈值参数与触发时间）。
+
+    可按（触发时的旧）策略修订号筛选；从未熔断过时返回空列表。
+    """
+    with db.read_transaction() as conn:
+        trips = store.list_breaker_trips(conn, policy_revision)
+    return {"trips": trips}
+
+
 @app.post("/deliver")
 def deliver(body: DeliverRequest) -> dict:
     """默认投递：按当前策略与规范化地址稳定分桶，选择基线或候选已发布版本解析。
@@ -415,6 +508,10 @@ def submit_delivery(body: DeliverySubmit) -> dict:
                         conn, delivery_id=body.delivery_id, address=address, policy=policy,
                         selection=chosen, version=version, status="ok", endpoints=endpoint_docs, error=None,
                     )
+                # 首次判定已持久化：按该策略修订号上的熔断设置评估候选侧窗口失败率。
+                # 可能在此把候选比例置 0 并递增策略修订号；本次请求仍返回上面的原判定，
+                # 后续默认投递按新策略（全基线）执行；重放分支不进入这里，故不重复计数。
+                circuit.evaluate_after_submit(conn, policy=policy, selection=chosen)
     except sqlite3.OperationalError as exc:  # 并发写冲突
         raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
     if conflict:

@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定与历史判定核对报表。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度、按修订号的熔断设置与熔断记录）、幂等投递判定与历史判定核对报表。"""
 from __future__ import annotations
 
 import json
@@ -48,6 +48,21 @@ class PolicyVersionNotFound(Exception):
     def __init__(self, version: int):
         super().__init__(f"published version not found: {version}")
         self.version = version
+
+
+class BreakerRevisionConflict(Exception):
+    """熔断设置所针对的修订号不是当前策略修订号（须针对新修订重新设置）。"""
+
+    def __init__(self, revision: int, current: int):
+        super().__init__(
+            f"circuit-breaker revision conflict: {revision} is not the current policy revision ({current})"
+        )
+        self.revision = revision
+        self.current = current
+
+
+class PolicyNotConfigured(Exception):
+    """尚未配置默认投递策略时设置熔断：明确拒绝，不产生任何熔断设置。"""
 
 
 def _row_to_rule(row: sqlite3.Row) -> Rule:
@@ -321,6 +336,148 @@ def replace_policy(
         "candidate_percent": candidate_percent,
         "updated_at": updated_at,
     }
+
+
+# ---------- 灰度熔断（按策略修订号设置候选侧失败率阈值，达标即把候选比例置 0 并递增修订号） ----------
+
+def get_breaker_setting(conn: sqlite3.Connection, policy_revision: int) -> dict | None:
+    """读取某个策略修订号上的熔断设置；未设置返回 None。"""
+    row = conn.execute(
+        "SELECT policy_revision, failure_threshold, min_samples, window_minutes, created_at, updated_at "
+        "FROM breaker_settings WHERE policy_revision = ?",
+        (policy_revision,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def put_breaker_setting(
+    conn: sqlite3.Connection,
+    expected_revision: int,
+    failure_threshold: int,
+    min_samples: int,
+    window_minutes: int,
+) -> dict:
+    """针对当前策略修订号设置 / 更新熔断参数。须在写事务内调用。
+
+    只能针对“当前”策略修订号设置：熔断触发或人工更新策略后修订号已前进，
+    针对旧修订号的设置请求抛 BreakerRevisionConflict（不产生任何变更），
+    操作方须取到新修订号后重新设置。同修订号重复设置为幂等更新（不产生熔断）。
+    """
+    current = get_policy(conn)
+    if current is None:
+        raise PolicyNotConfigured
+    if current["revision"] != expected_revision:
+        raise BreakerRevisionConflict(expected_revision, current["revision"])
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO breaker_settings (
+            policy_revision, failure_threshold, min_samples, window_minutes, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(policy_revision) DO UPDATE SET
+            failure_threshold = excluded.failure_threshold,
+            min_samples = excluded.min_samples,
+            window_minutes = excluded.window_minutes,
+            updated_at = excluded.updated_at
+        """,
+        (expected_revision, failure_threshold, min_samples, window_minutes, now, now),
+    )
+    return get_breaker_setting(conn, expected_revision)
+
+
+def breaker_already_tripped(conn: sqlite3.Connection, policy_revision: int) -> bool:
+    """该策略修订号是否已熔断过（每个修订号至多触发一次）。"""
+    return conn.execute(
+        "SELECT 1 FROM breaker_trips WHERE policy_revision = ?", (policy_revision,)
+    ).fetchone() is not None
+
+
+def breaker_candidate_window_stats(
+    conn: sqlite3.Connection,
+    *,
+    policy_revision: int,
+    window_start: str,
+) -> tuple[int, int]:
+    """统计同一策略修订号、观察窗口起点（含）之后已持久化的候选侧判定。
+
+    只统计候选侧（selection='candidate'）判定；成功与失败（rejected/no_route/cycle）
+    均计入样本，失败数仅含 status='failed'。重放不产生新行，故天然不重复计数。
+    """
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failures
+        FROM delivery_decisions
+        WHERE policy_revision = ? AND selection = 'candidate' AND created_at >= ?
+        """,
+        (policy_revision, window_start),
+    ).fetchone()
+    return row["total"], row["failures"] or 0
+
+
+def trip_breaker(
+    conn: sqlite3.Connection,
+    *,
+    old_revision: int,
+    sample_size: int,
+    failure_count: int,
+    setting: dict,
+    tripped_at: str,
+) -> dict | None:
+    """执行熔断：候选比例置 0、策略修订号 +1，并留档熔断记录。须在写事务内调用。
+
+    以修订号为条件更新策略：BEGIN IMMEDIATE 串行化下策略不可能在本事务期间被他人推进
+    （策略行在事务开头读出）；防御性地，若条件更新 0 行则放弃熔断（返回 None），
+    已持久化的首次判定照常提交，绝不因熔断异常而回滚判定。
+    breaker_trips 的 UNIQUE(policy_revision) 约束兜底保证同一修订号只熔断一次。
+    """
+    cur = conn.execute(
+        "UPDATE delivery_policy SET revision = ?, candidate_percent = 0, updated_at = ? "
+        "WHERE id = 1 AND revision = ?",
+        (old_revision + 1, tripped_at, old_revision),
+    )
+    if cur.rowcount != 1:  # 防御：串行化下不可达；宁可不熔断也不回滚首次判定
+        return None
+    conn.execute(
+        """
+        INSERT INTO breaker_trips (
+            policy_revision, new_revision, sample_size, failure_count,
+            failure_threshold, min_samples, window_minutes, tripped_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            old_revision, old_revision + 1, sample_size, failure_count,
+            setting["failure_threshold"], setting["min_samples"], setting["window_minutes"], tripped_at,
+        ),
+    )
+    return {
+        "policy_revision": old_revision,
+        "new_revision": old_revision + 1,
+        "sample_size": sample_size,
+        "failure_count": failure_count,
+        "failure_threshold": setting["failure_threshold"],
+        "min_samples": setting["min_samples"],
+        "window_minutes": setting["window_minutes"],
+        "tripped_at": tripped_at,
+    }
+
+
+def list_breaker_trips(conn: sqlite3.Connection, policy_revision: int | None = None) -> list[dict]:
+    """列出熔断记录（默认全部，按触发顺序）；可按（旧）策略修订号筛选。"""
+    if policy_revision is None:
+        rows = conn.execute(
+            "SELECT policy_revision, new_revision, sample_size, failure_count, "
+            "failure_threshold, min_samples, window_minutes, tripped_at "
+            "FROM breaker_trips ORDER BY id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT policy_revision, new_revision, sample_size, failure_count, "
+            "failure_threshold, min_samples, window_minutes, tripped_at "
+            "FROM breaker_trips WHERE policy_revision = ? ORDER BY id",
+            (policy_revision,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------- 幂等投递判定（投递编号 → 首次判定，永久可查、原样重放） ----------

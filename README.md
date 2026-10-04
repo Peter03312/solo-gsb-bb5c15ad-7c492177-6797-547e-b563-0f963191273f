@@ -36,6 +36,16 @@
   选中版本中的**拒收 / 无路由 / 成环仍整次失败，不自动改用另一版本**；
   未配置策略时明确报错（409），**不使用草稿或最新版本兜底**。
   策略只决定“默认用哪个已发布版本”，不影响显式版本解析，草稿与历史版本也不会被策略改写。
+- **灰度自动熔断**：`PUT /policy/circuit-breaker` 由操作方凭**当前策略修订号**设置候选侧**失败率阈值
+  （整数 1～100%）、最少候选判定数与观察窗口（分钟，正整数）**，`GET` 可查设置、
+  `GET /policy/circuit-breaker/trips` 查熔断记录。每次 `POST /deliveries` **首次提交判定持久化后**，
+  只统计**同一策略修订号**在观察窗口内已持久化的**候选侧判定**（成功与拒收 / 无路由 / 成环失败都计入）；
+  样本达下限且失败占比达到阈值时**只触发一次**：在同一事务内把**候选比例置 0 并递增策略修订号**，
+  记录**旧修订号、样本数、失败数与触发时间**。**触发请求仍返回原判定**（含原错误状态），
+  后续默认投递按基线执行；同编号重放不重复计数，历史判定及响应不改写。
+  人工更新策略（或自动熔断）后旧设置失效，须针对新修订重新设置；并发提交与人工更新在
+  `BEGIN IMMEDIATE` 事务下串行化，**不能覆盖彼此结果**。未配置策略（409）、非法参数（422）、
+  修订号冲突（409）均明确报错且不产生熔断。
 - **幂等投递判定**：`POST /deliveries` 由调用方提交**唯一投递编号 + 收件地址**（供可能超时重试的
   投递系统使用）。首次受理时按当前默认策略选定已发布版本，把**规范化地址、策略修订号、选中版本、
   完整终点路径（或拒收 / 无路由 / 成环错误）作为一份判定持久化**并返回。
@@ -101,6 +111,9 @@ pytest tests/ -q                                   # 运行测试
 | POST | `/preview`        | 预览当前草稿相对基线版本的投递变化     |
 | GET  | `/policy`         | 查看当前默认投递策略（未配置时 404）   |
 | PUT  | `/policy`         | 配置基线/候选版本与候选比例，需策略修订号 |
+| PUT  | `/policy/circuit-breaker` | 针对当前策略修订号设置熔断阈值（1–100%）、最少候选判定数、观察窗口（分钟） |
+| GET  | `/policy/circuit-breaker` | 查询熔断设置（缺省当前修订号，可按修订号查） |
+| GET  | `/policy/circuit-breaker/trips` | 查询熔断记录（旧修订号、样本数、失败数、触发时间） |
 | POST | `/deliver`        | 默认投递：按策略对收件地址稳定分桶解析 |
 | POST | `/deliveries`     | 幂等投递：投递编号 + 地址，首次判定持久化、重试原样返回 |
 | GET  | `/deliveries/report` | 历史判定核对报表：时间窗 + 分组计数 + 游标分页     |
@@ -491,6 +504,122 @@ curl http://localhost:8000/deliveries/msg-2026-10-04-0001
 > 既有 `/deliver`、`/resolve` 的请求、响应与错误约定完全不变：`/deliver` 仍只做即时分桶解析，
 > 不产生持久化判定；需要强制指定版本复现时继续使用 `/resolve`。
 
+## 灰度自动熔断：候选侧失败率达标即回退基线
+
+灰度期间若候选版本在候选流量上持续失败，系统可**自动熔断**：把候选比例置 `0`（后续默认投递全部
+走基线）并递增策略修订号，全程不需要人工介入。熔断只依据 `POST /deliveries` **已持久化的候选侧
+判定**，触发请求本身仍返回原判定。
+
+### 10.1 凭当前策略修订号设置熔断参数
+
+操作方先 `GET /policy` 取到**当前策略修订号**，再提交熔断设置：
+
+```bash
+curl -X PUT http://localhost:8000/policy/circuit-breaker \
+  -H 'Content-Type: application/json' -d '{
+    "revision": 1,
+    "failure_threshold": 50,
+    "min_samples": 10,
+    "window_minutes": 15
+  }'
+```
+
+- `failure_threshold`：候选侧**失败率阈值**，整数百分比 `1～100`；
+- `min_samples`：**最少候选判定数**，正整数（窗口内候选样本达到它才允许熔断）；
+- `window_minutes`：**观察窗口**（分钟），正整数，滚动窗口；
+- `revision`：**设置所针对的策略修订号，必须等于当前修订号**。
+
+```json
+{
+  "policy_revision": 1,
+  "failure_threshold": 50,
+  "min_samples": 10,
+  "window_minutes": 15,
+  "created_at": "2026-10-04T01:20:00+00:00",
+  "updated_at": "2026-10-04T01:20:00+00:00"
+}
+```
+
+- 同一修订号重复提交为**幂等更新**（不推进修订号、不产生熔断）。
+- 阈值比较为整数运算 `失败数 × 100 ≥ 阈值 × 样本数`（不做四舍五入）：
+  如阈值 `50%`、样本 `2`、失败 `1` 即达标。
+
+**明确报错（不写库、不产生熔断）**：
+
+| 场景 | 状态码 / 响应 |
+| ---- | ---- |
+| 从未配置策略 | `409 {"error": "policy_not_configured"}` |
+| `revision` 不是当前策略修订号（熔断或人工更新已推进） | `409 {"error": "breaker_revision_conflict", "revision": ..., "current_revision": ...}` |
+| 阈值不在 1～100、最少样本 / 窗口非正整数、缺字段 | `422`（请求模型校验） |
+
+### 10.2 查询设置与熔断记录
+
+```bash
+# 当前策略修订号上的设置
+curl http://localhost:8000/policy/circuit-breaker
+
+# 查某个历史修订号上的设置（留档可查；当前修订未设置时默认查询返回 404）
+curl 'http://localhost:8000/policy/circuit-breaker?policy_revision=1'
+
+# 全部熔断记录（可按触发时的旧修订号筛选）
+curl http://localhost:8000/policy/circuit-breaker/trips
+curl 'http://localhost:8000/policy/circuit-breaker/trips?policy_revision=1'
+```
+
+当前修订号未设置（含熔断 / 人工更新后旧设置失效）返回
+`404 {"error": "breaker_not_configured", "policy_revision": ..., "current_revision": ...}`。
+
+### 10.3 自动熔断如何触发、触发后发生什么
+
+每次 `POST /deliveries` **首次提交**把判定持久化后（成功或失败都会），在同一写事务内：
+
+1. 仅当本次判定落在**候选侧**、且该判定的**策略修订号上存在熔断设置、且该修订号尚未熔断过**时评估；
+2. 统计**同一策略修订号**、`now - window_minutes`（含）之后已持久化的**候选侧**判定：
+   成功与失败（`rejected` / `no_route` / `cycle`）都计入样本，失败数仅取 `status='failed'`；
+   同编号重放不产生新行，天然不重复计数；
+3. 样本数 `>= min_samples` 且失败占比 `>= failure_threshold` 时熔断**一次**：
+   **候选比例置 0、策略修订号 +1**，并写入熔断记录（旧修订号、新修订号、样本数、失败数、
+   当时的阈值参数与触发时间）。
+
+```bash
+# rev1：100% 候选，熔断设置 50% / 2 个样本 / 60 分钟
+curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' \
+  -d '{"delivery_id": "msg-1", "address": "blocked@corp.example.com"}'
+# => 422 rejected（第 1 个候选失败，样本不足，不熔断）
+
+curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' \
+  -d '{"delivery_id": "msg-2", "address": "shared@corp.example.com"}'
+# => 200，仍返回该次的候选侧原判定（响应里 policy_revision 仍为 1）；
+#    事务内同时完成熔断：策略变为 revision 2、candidate_percent 0
+
+curl http://localhost:8000/policy/circuit-breaker/trips
+# => {"trips": [{"policy_revision": 1, "new_revision": 2,
+#                "sample_size": 2, "failure_count": 1,
+#                "failure_threshold": 50, "min_samples": 2, "window_minutes": 60,
+#                "tripped_at": "2026-10-04T01:22:03+00:00"}]}
+```
+
+熔断后的行为约定：
+
+- **触发请求仍返回原判定**：触发熔断的那次提交照常返回候选侧结果（上例为 200；
+  若触发点是失败判定则仍返回原来的 `422`），响应体不被熔断改写。
+- **后续默认投递按基线执行**：`POST /deliver` 与之后首次受理的 `/deliveries` 都按新策略
+  （候选比例 `0`）选择基线版本；响应中的 `policy_revision` 为新修订号。
+- **历史判定及响应不改写**：熔断前持久化的判定（含策略修订号、候选比例、选中版本、
+  成功 / 失败内容）原样保留，按编号重放仍逐字段返回首次判定；核对报表也可按旧修订号照常统计。
+- **每个修订号只熔断一次**：`breaker_trips.policy_revision` 唯一，旧修订号不会二次触发。
+
+### 10.4 新修订号必须重新设置；并发不互相覆盖
+
+- **人工更新策略后旧设置失效**：`PUT /policy` 推进修订号后，旧修订号上的熔断设置不再作用于新修订
+  （默认查询对新修订返回 `404 breaker_not_configured`，旧设置仍可按旧修订号留档查询）；
+  自动熔断同理。要继续保护灰度，须取到新当前修订号后**重新 `PUT /policy/circuit-breaker`**；
+  拿旧修订号设置会得到 `409 breaker_revision_conflict`。
+- **并发安全**：熔断设置、人工 `PUT /policy` 与 `POST /deliveries` 的“核对 + 写入”都在单个
+  `BEGIN IMMEDIATE` 事务内完成并串行化。人工更新与自动熔断竞争同一修订号时，后到一方得到
+  `409 revision_conflict` / 按新策略受理，**绝不会出现比例被静默覆盖或一次熔断丢失**；
+  多个失败提交并发时熔断恰好发生一次，修订号恰好 +1。
+
 ## 历史投递判定核对报表：时间窗 + 分组计数 + 游标分页
 
 运营核对历史投递判定用 `GET /deliveries/report`：按**带时区的起止时刻**（左闭右开
@@ -573,11 +702,12 @@ app/
   db.py        # SQLite 连接、建表、BEGIN IMMEDIATE 事务、只读快照事务
   routing.py   # 地址校验、规则集、逐跳解析、发布前全量校验
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
+  circuit.py   # 灰度熔断：窗口内候选侧失败率达标即把候选比例置 0 并递增策略修订号（每修订号一次）
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   reporting.py # 核对报表：带时区时间窗（左闭右开）校验、页大小校验、翻页游标编解码
-  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组）
-  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定与核对报表的持久化与查询
-  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/deliver、/deliveries、/deliveries/report 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 按键合并与修订快照 + 核对报表
+  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/熔断参数）
+  store.py     # 草稿、修订快照、发布版本、默认投递策略、熔断设置与熔断记录、幂等投递判定与核对报表的持久化与查询
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/report 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略与自动熔断 + 幂等投递判定 + 按键合并与修订快照 + 核对报表
 Dockerfile / docker-compose.yml
 ```
