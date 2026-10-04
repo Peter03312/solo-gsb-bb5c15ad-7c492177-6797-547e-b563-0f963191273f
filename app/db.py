@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略与幂等投递判定。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定与灰度熔断。"""
 from __future__ import annotations
 
 import os
@@ -75,6 +75,31 @@ CREATE TABLE IF NOT EXISTS delivery_decisions (
     endpoints         TEXT,                             -- JSON: [{"mailbox", "paths"}]；status='ok' 时非空
     error             TEXT,                             -- JSON: 失败详情（rejected/no_route/cycle）；status='failed' 时非空
     created_at        TEXT NOT NULL
+);
+
+-- 灰度熔断设置：单行（id 恒为 1），绑定设置时所见的策略修订号。
+-- 策略修订号一旦变化（人工 PUT /policy 或自动熔断），旧设置即失效，
+-- 须凭新修订号重新设置；未配置策略时不允许设置。
+CREATE TABLE IF NOT EXISTS circuit_breaker_settings (
+    id                        INTEGER PRIMARY KEY CHECK (id = 1),
+    policy_revision           INTEGER NOT NULL,              -- 设置针对的策略修订号
+    failure_threshold_percent INTEGER NOT NULL CHECK (failure_threshold_percent BETWEEN 1 AND 100),
+    min_candidate_samples     INTEGER NOT NULL CHECK (min_candidate_samples >= 1),
+    window_minutes            INTEGER NOT NULL CHECK (window_minutes >= 1),
+    updated_at                TEXT NOT NULL
+);
+
+-- 熔断记录：每次触发一行——旧策略修订号、窗口内候选样本数、失败数与触发时间，
+-- 并留存触发依据的设置快照供事后核对。记录只增不改。
+CREATE TABLE IF NOT EXISTS circuit_breaks (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_revision           INTEGER NOT NULL,              -- 触发时（旧）策略修订号
+    failure_threshold_percent INTEGER NOT NULL,              -- 触发依据的设置快照
+    min_candidate_samples     INTEGER NOT NULL,
+    window_minutes            INTEGER NOT NULL,
+    sample_count              INTEGER NOT NULL,              -- 窗口内同修订号的候选判定数
+    failure_count             INTEGER NOT NULL,              -- 其中失败数
+    triggered_at              TEXT NOT NULL
 );
 """
 

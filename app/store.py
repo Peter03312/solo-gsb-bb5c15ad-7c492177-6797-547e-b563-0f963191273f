@@ -1,9 +1,9 @@
-"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定与历史判定核对报表。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .routing import Rule, RuleSet, Target
 
@@ -48,6 +48,13 @@ class PolicyVersionNotFound(Exception):
     def __init__(self, version: int):
         super().__init__(f"published version not found: {version}")
         self.version = version
+
+
+class PolicyNotConfigured(Exception):
+    """默认投递策略尚未配置（熔断设置等依赖策略的操作据此明确拒绝）。"""
+
+    def __init__(self):
+        super().__init__("no delivery policy configured")
 
 
 def _row_to_rule(row: sqlite3.Row) -> Rule:
@@ -320,6 +327,158 @@ def replace_policy(
         "candidate_version": candidate_version,
         "candidate_percent": candidate_percent,
         "updated_at": updated_at,
+    }
+
+
+# ---------- 灰度自动熔断（按候选侧失败率熔断，设置绑定策略修订号） ----------
+#
+# 设置针对设置时所见的策略修订号；策略修订号一旦变化（人工 PUT /policy 或自动熔断
+# 都会令其 +1），旧设置即失效——评估时只认“设置的政策修订号 == 当前策略修订号”。
+# 评估发生在首次投递判定持久化之后、同一 BEGIN IMMEDIATE 事务内：只统计同一策略
+# 修订号、窗口内已持久化的候选侧判定；样本达下限且失败占比达阈值时触发一次——
+# 候选比例置 0、策略修订号 +1 并写入一条熔断记录。修订号随之变化使旧设置失效，
+# 因此同一设置天然只触发一次；并发提交与人工更新由 BEGIN IMMEDIATE 串行化，
+# 后到者只能看到前者已提交的结果（修订号已变），不会互相覆盖。
+
+def get_circuit_breaker_settings(conn: sqlite3.Connection) -> dict | None:
+    """读取最近保存的熔断设置（可能已随策略修订号变化而失效）；从未设置返回 None。"""
+    row = conn.execute(
+        "SELECT policy_revision, failure_threshold_percent, min_candidate_samples, "
+        "window_minutes, updated_at FROM circuit_breaker_settings WHERE id = 1"
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_active_circuit_breaker_settings(
+    conn: sqlite3.Connection, policy_revision: int
+) -> dict | None:
+    """读取对指定策略修订号仍然有效的熔断设置；未设置或已失效返回 None。"""
+    settings = get_circuit_breaker_settings(conn)
+    if settings is None or settings["policy_revision"] != policy_revision:
+        return None
+    return settings
+
+
+def save_circuit_breaker_settings(
+    conn: sqlite3.Connection,
+    expected_revision: int,
+    failure_threshold_percent: int,
+    min_candidate_samples: int,
+    window_minutes: int,
+) -> dict:
+    """凭所见策略修订号保存熔断设置（针对当前策略修订号生效）。须在事务内调用。
+
+    - 未配置策略抛 PolicyNotConfigured；所见修订号与当前策略修订号不一致抛
+      RevisionConflict——两者都不落任何设置，也不会产生熔断；
+    - 成功则整体替换旧设置（针对新修订号须重新设置，旧设置随之失效）。
+    """
+    policy = get_policy(conn)
+    if policy is None:
+        raise PolicyNotConfigured()
+    if policy["revision"] != expected_revision:
+        raise RevisionConflict(policy["revision"], subject="policy")
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO circuit_breaker_settings (
+            id, policy_revision, failure_threshold_percent,
+            min_candidate_samples, window_minutes, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            policy_revision = excluded.policy_revision,
+            failure_threshold_percent = excluded.failure_threshold_percent,
+            min_candidate_samples = excluded.min_candidate_samples,
+            window_minutes = excluded.window_minutes,
+            updated_at = excluded.updated_at
+        """,
+        (
+            policy["revision"],
+            failure_threshold_percent,
+            min_candidate_samples,
+            window_minutes,
+            updated_at,
+        ),
+    )
+    return {
+        "policy_revision": policy["revision"],
+        "failure_threshold_percent": failure_threshold_percent,
+        "min_candidate_samples": min_candidate_samples,
+        "window_minutes": window_minutes,
+        "updated_at": updated_at,
+    }
+
+
+def list_circuit_breaks(conn: sqlite3.Connection) -> list[dict]:
+    """按触发顺序列出全部熔断记录（只增不改）。"""
+    rows = conn.execute(
+        "SELECT id, policy_revision, failure_threshold_percent, min_candidate_samples, "
+        "window_minutes, sample_count, failure_count, triggered_at "
+        "FROM circuit_breaks ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def maybe_trigger_circuit_breaker(conn: sqlite3.Connection, policy: dict) -> dict | None:
+    """首次投递判定持久化后评估候选侧失败率，达到条件则熔断。须在写事务内调用。
+
+    policy 为本事务内受理判定时的当前策略（BEGIN IMMEDIATE 保证事务期间不变）。
+    仅统计同一策略修订号、窗口内已持久化的候选侧判定（含本次刚写入的判定；
+    同编号重放不会走到这里，自然不重复计数）。样本达下限且失败数占比达到阈值时：
+    候选比例置 0、策略修订号 +1，并记录旧修订号、样本数、失败数与触发时间。
+    设置不存在或已失效（修订号不匹配）时不评估；返回熔断记录或 None。
+    """
+    settings = get_active_circuit_breaker_settings(conn, policy["revision"])
+    if settings is None:
+        return None
+    now = datetime.now(timezone.utc)
+    # created_at 一律为 UTC ISO 秒精度字符串，可直接按字符串比较窗口下界
+    cutoff = (now - timedelta(minutes=settings["window_minutes"])).isoformat(timespec="seconds")
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS samples,
+               COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failures
+        FROM delivery_decisions
+        WHERE policy_revision = ? AND selection = 'candidate' AND created_at >= ?
+        """,
+        (policy["revision"], cutoff),
+    ).fetchone()
+    samples, failures = row["samples"], row["failures"]
+    if samples < settings["min_candidate_samples"]:
+        return None
+    if failures * 100 < settings["failure_threshold_percent"] * samples:  # 整数比较：失败占比未达阈值
+        return None
+    triggered_at = now.isoformat(timespec="seconds")
+    conn.execute(
+        "UPDATE delivery_policy SET candidate_percent = 0, revision = revision + 1, "
+        "updated_at = ? WHERE id = 1",
+        (triggered_at,),
+    )
+    cur = conn.execute(
+        """
+        INSERT INTO circuit_breaks (
+            policy_revision, failure_threshold_percent, min_candidate_samples,
+            window_minutes, sample_count, failure_count, triggered_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            policy["revision"],
+            settings["failure_threshold_percent"],
+            settings["min_candidate_samples"],
+            settings["window_minutes"],
+            samples,
+            failures,
+            triggered_at,
+        ),
+    )
+    return {
+        "id": cur.lastrowid,
+        "policy_revision": policy["revision"],
+        "failure_threshold_percent": settings["failure_threshold_percent"],
+        "min_candidate_samples": settings["min_candidate_samples"],
+        "window_minutes": settings["window_minutes"],
+        "sample_count": samples,
+        "failure_count": failures,
+        "triggered_at": triggered_at,
     }
 
 

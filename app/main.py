@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定、历史判定核对报表。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import sqlite3
@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from . import db, preview, reporting, store
 from .models import (
+    CircuitBreakerUpdate,
     DeliverRequest,
     DeliverySubmit,
     DraftChangesRequest,
@@ -297,6 +298,78 @@ def put_policy(body: PolicyUpdate) -> dict:
     return _policy_doc(policy)
 
 
+# ---------- 灰度自动熔断（候选侧失败率达阈值 → 候选比例自动置 0） ----------
+
+def _circuit_breaker_settings_doc(settings: dict) -> dict:
+    return {
+        "policy_revision": settings["policy_revision"],
+        "failure_threshold_percent": settings["failure_threshold_percent"],
+        "min_candidate_samples": settings["min_candidate_samples"],
+        "window_minutes": settings["window_minutes"],
+        "updated_at": settings["updated_at"],
+    }
+
+
+@app.put("/policy/circuit-breaker")
+def put_circuit_breaker(body: CircuitBreakerUpdate) -> dict:
+    """凭所见策略修订号设置灰度熔断：失败率阈值（1–100）、最少候选判定数与观察窗口（分钟）。
+
+    设置针对当前策略修订号生效；人工更新策略（PUT /policy）或自动熔断都会使策略
+    修订号 +1，旧设置随之失效，须凭新修订号重新设置。
+    未配置策略（409 policy_not_configured）、修订号冲突（409 revision_conflict）、
+    非法参数（422）都明确报错且不产生任何熔断；核对与保存在单个
+    BEGIN IMMEDIATE 事务内原子完成，与并发投递提交互串行化、互不覆盖。
+    """
+    try:
+        with db.transaction() as conn:
+            settings = store.save_circuit_breaker_settings(
+                conn,
+                body.revision,
+                body.failure_threshold_percent,
+                body.min_candidate_samples,
+                body.window_minutes,
+            )
+    except store.PolicyNotConfigured as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "policy_not_configured",
+                    "message": "no delivery policy configured; configure one via PUT /policy first"},
+        )
+    except store.RevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "revision_conflict", "current_revision": exc.current, "message": str(exc)},
+        )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return _circuit_breaker_settings_doc(settings)
+
+
+@app.get("/policy/circuit-breaker")
+def get_circuit_breaker() -> dict:
+    """查询当前熔断设置与全部熔断记录。
+
+    settings 仅在对当前策略修订号有效时非空（人工更新策略或自动熔断后旧设置失效，
+    为 null，须重新设置）；breaks 按触发顺序列出每次熔断的旧策略修订号、
+    窗口内候选样本数、失败数与触发时间。未配置策略时返回 404。
+    """
+    with db.read_transaction() as conn:
+        policy = store.get_policy(conn)
+        if policy is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "policy_not_configured", "revision": 0,
+                        "message": "no delivery policy configured"},
+            )
+        settings = store.get_active_circuit_breaker_settings(conn, policy["revision"])
+        breaks = store.list_circuit_breaks(conn)
+    return {
+        "policy_revision": policy["revision"],
+        "settings": _circuit_breaker_settings_doc(settings) if settings is not None else None,
+        "breaks": breaks,
+    }
+
+
 @app.post("/deliver")
 def deliver(body: DeliverRequest) -> dict:
     """默认投递：按当前策略与规范化地址稳定分桶，选择基线或候选已发布版本解析。
@@ -369,6 +442,9 @@ def submit_delivery(body: DeliverySubmit) -> dict:
     相同编号 + 相同规范化地址的并发或后续请求原样返回首次判定（含原错误状态），
     即使策略随后改变；编号相同而地址不同返回 409。
     无效地址（422）与未配置策略（409）不占用编号；选中版本失败整次失败，不切换版本。
+    首次判定持久化后，若当前策略修订号设有熔断设置，则按窗口内候选侧失败率评估：
+    达到条件时候选比例置 0、策略修订号 +1（只触发一次，影响后续投递）；
+    本次请求仍返回已持久化的原判定，同编号重放不参与统计。
     """
     address = body.address.strip().lower()
     if not is_valid_address(address):  # 无效地址不占用编号
@@ -415,6 +491,10 @@ def submit_delivery(body: DeliverySubmit) -> dict:
                         conn, delivery_id=body.delivery_id, address=address, policy=policy,
                         selection=chosen, version=version, status="ok", endpoints=endpoint_docs, error=None,
                     )
+                # 首次判定已持久化：按当前策略修订号的熔断设置评估候选侧失败率。
+                # 触发也只把候选比例置 0 并递增策略修订号（影响后续投递）；
+                # 本次响应仍为上面已持久化的原判定，历史判定不改写。
+                store.maybe_trigger_circuit_breaker(conn, policy)
     except sqlite3.OperationalError as exc:  # 并发写冲突
         raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
     if conflict:

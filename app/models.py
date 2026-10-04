@@ -71,6 +71,13 @@ class PolicyUpdate(BaseModel):
     revision: int = Field(ge=0, description="客户端所见策略修订号（未配置时为 0）")
 
 
+class CircuitBreakerUpdate(BaseModel):
+    failure_threshold_percent: int = Field(ge=1, le=100, description="候选侧失败率阈值（整数 1–100）")
+    min_candidate_samples: int = Field(ge=1, description="最少候选判定数（正整数）")
+    window_minutes: int = Field(ge=1, description="观察窗口（分钟，正整数）")
+    revision: int = Field(ge=0, description="客户端所见策略修订号（设置针对该修订生效）")
+
+
 class DeliverRequest(BaseModel):
     address: str
 

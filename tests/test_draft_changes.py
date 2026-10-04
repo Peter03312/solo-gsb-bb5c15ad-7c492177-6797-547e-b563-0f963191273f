@@ -27,6 +27,8 @@ def _reset():
         "DELETE FROM draft_rules;"
         "DELETE FROM delivery_policy;"
         "DELETE FROM delivery_decisions;"
+        "DELETE FROM circuit_breaker_settings;"
+        "DELETE FROM circuit_breaks;"
         "DELETE FROM version_rules;"
         "DELETE FROM versions;"
         "DELETE FROM sqlite_sequence WHERE name = 'versions';"
